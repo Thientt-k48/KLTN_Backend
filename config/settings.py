@@ -147,16 +147,25 @@ SIMPLE_JWT = {
 
 import os
 
-# Đường dẫn URL để truy cập file (VD: http://localhost:8000/media/sach.pdf)
-MEDIA_URL = '/media/'
+
 
 # Thư mục thực tế trên ổ cứng để chứa file
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 AUTH_USER_MODEL = 'users.User'
 
-GOOGLE_API_KEY = "AIzaSyD8a9fEb2f--ztrEhkucrOASxLZYkot1ds"
+GOOGLE_API_KEY = "AIzaSyD5Jc10BkvTrZxVSdTJVrmYTDvSHam7-zk"
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "12345678")
 
 CORS_ALLOW_ALL_ORIGINS = True
+
+# Cấu hình kết nối MongoDB
+MONGO_URI = "mongodb://localhost:27017/"
+MONGO_DB_NAME = "textbook_db"
+
+MINIO_STORAGE_ENDPOINT = "localhost:9000"
+MINIO_STORAGE_ACCESS_KEY = "minioadmin"
+MINIO_STORAGE_SECRET_KEY = "minioadmin"
+MINIO_STORAGE_BUCKET_NAME = "sach-giao-khoa"
+MINIO_STORAGE_USE_HTTPS = False

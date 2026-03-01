@@ -1,108 +1,151 @@
-import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
+import boto3
+from botocore.client import Config
+from pymongo import MongoClient
 from neo4j import GraphDatabase
+import google.generativeai as genai
 from django.conf import settings
+from django.db import connection # Sử dụng kết nối DB có sẵn của Django
 
-# 1. Khởi tạo Model Embedding (Chỉ load 1 lần khi chạy server)
-print("⏳ Đang tải model Embedding...")
-embedding_model = SentenceTransformer('keepitreal/vietnamese-sbert')
+# --- KHỞI TẠO CÁC KẾT NỐI TỪ SETTINGS.PY ---
 
-# 2. Khởi tạo Gemini
+# Gemini
 genai.configure(api_key=settings.GOOGLE_API_KEY)
-gemini_model = genai.GenerativeModel('gemini-1.5-flash')
+gemini_model = genai.GenerativeModel('gemini-2.5-flash')
 
-# 3. Kết nối Neo4j
-neo4j_driver = GraphDatabase.driver(settings.NEO4J_URI, auth=settings.NEO4J_AUTH)
+# Neo4j
+neo4j_driver = GraphDatabase.driver(
+    settings.NEO4J_URI, 
+    auth=settings.NEO4J_AUTH
+)
 
-def search_neo4j(query_text, threshold=0.9):
-    """
-    Tìm kiếm vector trong Neo4j.
-    Trả về: (Nội dung tìm thấy, Score) hoặc (None, 0)
-    """
-    query_vector = embedding_model.encode(query_text).tolist()
-    
-    cypher_query = """
-    CALL db.index.vector.queryNodes('question_embeddings', 1, $vec)
-    YIELD node, score
-    
-    // Chỉ lấy kết quả nếu score >= ngưỡng (0.9)
-    WHERE score >= $threshold
-    
-    // Tìm ngược lại Chunk gốc để lấy ngữ cảnh đầy đủ hơn
-    MATCH (node)<-[:HAS_QUESTION]-(c:Chunk)
-    
-    RETURN 
-        node.question_text AS similar_q,
-        node.answer_text AS answer,
-        c.content AS context,
-        score
-    """
-    
-    with neo4j_driver.session() as session:
-        result = session.run(cypher_query, vec=query_vector, threshold=threshold)
-        record = result.single()
+# MongoDB
+mongo_client = MongoClient(settings.MONGO_URI)
+mongo_db = mongo_client[settings.MONGO_DB_NAME]
+
+# MinIO (S3)
+s3_client = boto3.client(
+    's3',
+    endpoint_url=f"{'https' if settings.MINIO_STORAGE_USE_HTTPS else 'http'}://{settings.MINIO_STORAGE_ENDPOINT}",
+    aws_access_key_id=settings.MINIO_STORAGE_ACCESS_KEY,
+    aws_secret_access_key=settings.MINIO_STORAGE_SECRET_KEY,
+    config=Config(signature_version='s3v4'),
+    region_name='us-east-1'
+)
+
+# --- CÁC HÀM TRUY XUẤT DỮ LIỆU ---
+
+def get_minio_link(file_source):
+    """Tạo link xem tài liệu từ MinIO"""
+    if not file_source: return None
+    try:
+        return s3_client.generate_presigned_url(
+            'get_object',
+            Params={'Bucket': settings.MINIO_STORAGE_BUCKET_NAME, 'Key': file_source},
+            ExpiresIn=3600
+        )
+    except Exception as e:
+        print(f"❌ Lỗi MinIO: {e}")
+        return None
+
+def get_file_source_from_pg(semantic_id, is_question=True):
+    """Lấy file_source từ PostgreSQL sử dụng connection của Django"""
+    with connection.cursor() as cursor:
+        if is_question:
+            # Nếu là Question, join qua bảng content_chunks để lấy file_source
+            sql = """
+                SELECT c.file_source 
+                FROM questions q 
+                JOIN content_chunks c ON q.chunk_id = c.id 
+                WHERE q.semantic_id = %s
+            """
+        else:
+            # Nếu là Chunk, lấy trực tiếp từ bảng content_chunks
+            sql = "SELECT file_source FROM content_chunks WHERE semantic_id = %s"
         
-        if record:
-            # Gom thông tin lại để đưa cho AI
-            context_data = {
-                "similar_question": record['similar_q'],
-                "db_answer": record['answer'],
-                "chunk_content": record['context'],
-                "score": record['score']
+        cursor.execute(sql, [semantic_id])
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+def search_mongodb_chunks(query_vector, threshold=0.8):
+    """Tìm kiếm vector trong MongoDB collection 'chunks'"""
+    try:
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "vector_index", # Tên index đã tạo trên MongoDB Atlas
+                    "path": "vector",
+                    "queryVector": query_vector,
+                    "numCandidates": 10,
+                    "limit": 1
+                }
+            },
+            {
+                "$project": {
+                    "semantic_id": 1, 
+                    "content": 1,
+                    "score": {"$meta": "vectorSearchScore"}
+                }
             }
-            return context_data, record['score']
-            
-    return None, 0.0
+        ]
+        results = list(mongo_db.chunks.aggregate(pipeline))
+        if results and results[0]['score'] >= threshold:
+            return results[0]['semantic_id'], results[0]['content'], results[0]['score']
+    except Exception as e:
+        print(f"❌ MongoDB Vector Search Error: {e}")
+    return None, None, 0.0
+
+# --- LUỒNG XỬ LÝ CHÍNH ---
 
 def generate_response(user_question):
-    """
-    Hàm xử lý chính cho Chatbot
-    """
-    # Bước 1: Tìm kiếm trong Neo4j với ngưỡng 0.9 (90%)
-    found_data, score = search_neo4j(user_question, threshold=0.9)
-    
-    if found_data:
-        # --- TRƯỜNG HỢP 1: TÌM THẤY (SCORE >= 0.9) ---
-        print(f"✅ Tìm thấy trong DB (Score: {score:.4f})")
-        
-        # Prompt yêu cầu Gemini diễn đạt lại dựa trên thông tin tìm thấy
-        prompt = f"""
-        Bạn là một trợ lý ảo giáo dục thân thiện.
-        Người dùng hỏi: "{user_question}"
-        
-        Tôi đã tìm thấy thông tin chính xác trong cơ sở dữ liệu như sau:
-        - Câu hỏi gốc trong DB: {found_data['similar_question']}
-        - Câu trả lời trong DB: {found_data['db_answer']}
-        - Ngữ cảnh sách giáo khoa: {found_data['chunk_content']}
-        
-        Yêu cầu: Hãy sử dụng thông tin trên để trả lời người dùng một cách tự nhiên, mượt mà, đúng trọng tâm câu hỏi của họ. 
-        Không được bịa thêm thông tin sai lệch ngoài ngữ cảnh cung cấp.
+    # 1. Embedding câu hỏi
+    embed_res = genai.embed_content(
+        model="models/text-embedding-004",
+        content=user_question,
+        task_type="retrieval_query",
+        output_dimensionality=768
+    )
+    vector = embed_res['embedding']
+
+    # 2. Tìm kiếm Hybrid
+    sid = None
+    match_type = None
+    context_text = ""
+    score = 0.0
+
+    # Ưu tiên Neo4j (Question)
+    with neo4j_driver.session() as session:
+        cypher = """
+        CALL db.index.vector.queryNodes('question_embeddings', 1, $vec)
+        YIELD node, score WHERE score >= 0.9
+        RETURN node.semantic_id AS sid, score
         """
-        
+        res = session.run(cypher, vec=vector).single()
+        if res:
+            sid, match_type, score = res['sid'], 'question', res['score']
+            # Lấy thêm text từ MongoDB để đưa vào prompt
+            q_doc = mongo_db.questions.find_one({"semantic_id": sid})
+            context_text = q_doc.get('answer_text', '') if q_doc else ""
+
+    # Nếu Neo4j không thấy, tìm Chunk ở MongoDB
+    if not sid:
+        sid, context_text, score = search_mongodb_chunks(vector)
+        match_type = 'chunk' if sid else None
+
+    # 3. Tổng hợp kết quả
+    if sid:
+        file_source = get_file_source_from_pg(sid, is_question=(match_type == 'question'))
+        doc_link = get_minio_link(file_source)
+
+        prompt = f"Dựa vào kiến thức: {context_text}, trả lời câu hỏi: {user_question}"
         response = gemini_model.generate_content(prompt)
+
         return {
             "response": response.text,
             "source": "database",
-            "score": score,
-            "context": found_data['similar_question'] # Để debug nếu cần
+            "doc_link": doc_link,
+            "score": score
         }
-        
-    else:
-        # --- TRƯỜNG HỢP 2: KHÔNG TÌM THẤY (SCORE < 0.9) ---
-        print(f"⚠️ Không khớp đủ ngưỡng (Score cao nhất < 0.9). Gọi Gemini trả lời tự do.")
-        
-        prompt = f"""
-        Bạn là một trợ lý ảo giáo dục.
-        Người dùng hỏi: "{user_question}"
-        
-        Hiện tại trong sách giáo khoa không có câu trả lời khớp hoàn toàn. 
-        Hãy trả lời câu hỏi này dựa trên kiến thức chung của bạn một cách chính xác và hữu ích.
-        Nếu câu hỏi không thuộc lĩnh vực tin học/giáo dục, hãy khéo léo từ chối.
-        """
-        
-        response = gemini_model.generate_content(prompt)
-        return {
-            "response": response.text,
-            "source": "gemini_knowledge",
-            "score": 0.0
-        }
+
+    # 4. Fallback Gemini
+    response = gemini_model.generate_content(user_question)
+    return {"response": response.text, "source": "gemini_knowledge"}

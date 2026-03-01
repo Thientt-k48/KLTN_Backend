@@ -7,6 +7,8 @@ from django.contrib.auth.models import User
 from .models import ChatSession, ChatMessage
 from .serializers import ChatSessionSerializer, ChatHistorySerializer
 from .rag_service import generate_response
+from rest_framework.permissions import IsAuthenticated
+from .models import ChatSession, ChatMessage
 
 # API 14: Tạo phiên chat
 class CreateChatSessionView(APIView):
@@ -116,55 +118,72 @@ class SaveChatLogView(APIView):
 
     # API 17: Xem lịch sử chat
 class GetChatHistoryView(APIView):
+    permission_classes = [IsAuthenticated]
+
     def get(self, request):
-        """
-        Input: URL ?session_id=...
-        Output: [{ "role": "user", "msg": "..." }, ...]
-        """
-        # 1. Lấy session_id từ URL (Query Param)
         session_id = request.query_params.get('session_id')
 
-        if not session_id:
-            return Response({"error": "Thiếu tham số session_id"}, status=status.HTTP_400_BAD_REQUEST)
+        # Kiểm tra session_id hợp lệ
+        if session_id and session_id not in ['undefined', 'null', '']:
+            try:
+                # Sửa lại filter: dùng 'session' (tên field trong model ChatMessage)
+                messages = ChatMessage.objects.filter(session=session_id).order_by('created_at')
+                
+                # Nếu không tìm thấy tin nhắn nào, có thể session_id sai hoặc chưa có tin nhắn
+                serializer = ChatHistorySerializer(messages, many=True)
+                return Response(serializer.data, status=status.HTTP_200_OK)
+            
+            except Exception as e:
+                # In lỗi cụ thể ra terminal của Django để bạn kiểm tra
+                print(f"❌ Lỗi truy vấn tin nhắn: {e}")
+                return Response({"error": "Không thể tải tin nhắn", "detail": str(e)}, status=400)
 
-        # 2. Lấy danh sách tin nhắn của session đó
-        # order_by('created_at'): Sắp xếp từ cũ đến mới
-        messages = ChatMessage.objects.filter(session_id=session_id).order_by('created_at')
+        # Nếu không có session_id, trả về danh sách phiên chat của user
+        try:
+            sessions = ChatSession.objects.filter(user=request.user).order_by('-created_at')
+            serializer = ChatSessionSerializer(sessions, many=True)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        except Exception as e:
+            print(f"❌ Lỗi truy vấn danh sách phiên: {e}")
+            return Response({"error": "Không thể tải lịch sử"}, status=400)
 
-        # 3. Kiểm tra xem có tin nhắn nào không (Optional)
-        if not messages.exists():
-             # Có thể trả về mảng rỗng [] hoặc báo lỗi tùy logic bạn muốn
-             return Response([], status=status.HTTP_200_OK)
-
-        # 4. Serialize dữ liệu và trả về
-        serializer = ChatHistorySerializer(messages, many=True)
-        return Response(serializer.data, status=status.HTTP_200_OK)   
 
 class ChatAPIView(APIView):
+    permission_classes = [IsAuthenticated]
+
     def post(self, request):
         user_message = request.data.get('message')
+        session_id = request.data.get('session_id')
         
         if not user_message:
-            return Response(
-                {"error": "Vui lòng nhập câu hỏi."}, 
-                status=status.HTTP_400_BAD_REQUEST
-            )
+            return Response({"error": "No message"}, status=400)
 
-        try:
-            # Gọi hàm xử lý logic từ service
-            result = generate_response(user_message)
-            
-            return Response({
-                "data": result['response'],
-                "meta": {
-                    "source": result['source'],
-                    "score": result.get('score', 0)
-                }
-            }, status=status.HTTP_200_OK)
-            
-        except Exception as e:
-            print(f"Lỗi Chat API: {e}")
-            return Response(
-                {"error": "Đã có lỗi xảy ra khi xử lý câu hỏi."}, 
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
-            )
+        # 1. Quản lý Session
+        if session_id:
+            session = ChatSession.objects.filter(session_id=session_id, user=request.user).first()
+        else:
+            session = ChatSession.objects.create(user=request.user, title=user_message[:50])
+
+        # 2. Lưu câu hỏi người dùng
+        ChatMessage.objects.create(session=session, role='user', content=user_message)
+
+        # 3. RAG + Gemini
+        result = generate_response(user_message)
+
+        # 4. Lưu câu trả lời AI
+        ChatMessage.objects.create(
+            session=session, 
+            role='assistant', 
+            content=result['response'],
+            doc_link=result.get('doc_link'),
+            sources={"source": result['source']}
+        )
+
+        return Response({
+            "data": result['response'],
+            "doc_link": result.get('doc_link'), # THÊM DÒNG NÀY
+            "meta": {
+                "source": result['source'],
+                "score": result.get('score', 0)
+            }
+        }, status=status.HTTP_200_OK)
