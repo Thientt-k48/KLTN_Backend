@@ -175,8 +175,10 @@ class ChatAPIView(APIView):
             session=session, 
             role='assistant', 
             content=result['response'],
-            doc_link=result.get('doc_link'),
-            sources={"source": result['source']}
+            sources={
+                "source": result['source'],
+                "doc_link": result.get('doc_link') 
+            }
         )
 
         return Response({

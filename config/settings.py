@@ -154,7 +154,7 @@ MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 
 AUTH_USER_MODEL = 'users.User'
 
-GOOGLE_API_KEY = "AIzaSyD5Jc10BkvTrZxVSdTJVrmYTDvSHam7-zk"
+GOOGLE_API_KEY = "AIzaSyCuvG13esth3AlnFwqIYeDKcbskAnCnbLE"
 NEO4J_URI = "bolt://localhost:7687"
 NEO4J_AUTH = ("neo4j", "12345678")
 
