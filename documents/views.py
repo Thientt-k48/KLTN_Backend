@@ -11,6 +11,7 @@ from .models import Document
 from .serializers import DocumentSerializer
 from utils.db_connection import get_mongo_db, get_neo4j_session
 import threading
+from .etl_service import run_etl_pipeline
 
 mongo_client = MongoClient(settings.MONGO_URI)
 mongo_db = mongo_client[settings.MONGO_DB_NAME]
